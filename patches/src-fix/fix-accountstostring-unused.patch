@@ -1,0 +1,16 @@
+description: mark AccountsToString [[maybe_unused]]. ungoogled-chromium core
+ remove-unused-preferences-fields removed 3 of its 4 call sites, leaving only a
+ DCHECK use that compiles away in official builds -> -Wunused-function -Werror.
+author: bearinmindcat <bearinmindcat@gmail.com>
+
+--- a/components/signin/internal/identity_manager/account_tracker_service.cc
++++ b/components/signin/internal/identity_manager/account_tracker_service.cc
+@@ -106,7 +106,7 @@
+   }
+ }
+ 
+-std::string AccountsToString(
++[[maybe_unused]] std::string AccountsToString(
+     const std::map<CoreAccountId, AccountInfo>& accounts) {
+   std::stringstream result;
+   result << "[";
