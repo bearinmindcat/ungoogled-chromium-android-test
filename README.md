@@ -96,6 +96,10 @@ Pre-built apks are named as `{BUILD_TARGET}_{CPU_ARCH}.apk`, where:
 * Make sure you have enough disk space and memory to build chromium
 * enter repo directory and run `./build.sh`.
 
+Dependencies can be installed automatically with `./build.sh --install-deps ...`, which runs
+Chromium's own `build/install-build-deps.sh --android` once the source is fetched. It needs root
+or passwordless sudo; otherwise install them by hand from the list below.
+
 Build time dependencies (*package names as in Debian. Other distributions may have different package names*):
 
 <details>

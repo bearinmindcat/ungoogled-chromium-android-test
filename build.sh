@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -eu -o pipefail
 
-
-# Required packages are listed in README.md.
-
 source .build_config
 
 # Show env
@@ -19,8 +16,8 @@ if [[ ${PIPESTATUS[0]} -ne 4 ]]; then
     exit 1
 fi
 
-OPTIONS=dla:t:
-LONGOPTS=debug,local-sdk,arch:,target:
+OPTIONS=dlia:t:
+LONGOPTS=debug,local-sdk,install-deps,arch:,target:
 
 ! PARSED=$(getopt --options=$OPTIONS --longoptions=$LONGOPTS --name "$0" -- "$@")
 if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
@@ -28,7 +25,7 @@ if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
 fi
 eval set -- "$PARSED"
 
-ARCH=- TARGET=- DEBUG=n LOCAL_SDK=n
+ARCH=- TARGET=- DEBUG=n LOCAL_SDK=n INSTALL_DEPS=n
 
 while true; do
     case "$1" in
@@ -38,6 +35,10 @@ while true; do
             ;;
         -l|--local-sdk)
             LOCAL_SDK=y
+            shift
+            ;;
+        -i|--install-deps)
+            INSTALL_DEPS=y
             shift
             ;;
         -a|--arch)
@@ -87,6 +88,9 @@ echo "arch: $ARCH, target: $TARGET, target expanded: ${TARGET_EXPANDED}, debug: 
 path_modified=false
 
 function prepare_repos {
+  git config --global http.lowSpeedLimit 1000
+  git config --global http.lowSpeedTime 900
+
   declare -a arr=("depot_tools" "src" "ungoogled-chromium" ".cipd")
   for dname in "${arr[@]}"
   do
@@ -103,8 +107,24 @@ function prepare_repos {
   git clone https://github.com/ungoogled-software/ungoogled-chromium.git -b ${ungoogled_chromium_version}-${ungoogled_chromium_revision} \
    || return $?
 
-  ## Clone chromium repo
-  git clone --depth 1 --no-tags https://chromium.googlesource.com/chromium/src.git -b ${chromium_version} || return $?
+  CHROMIUM_SOURCE="${CHROMIUM_SOURCE:-https://chromium.googlesource.com/chromium/src.git}"
+  mkdir -p src
+  pushd src
+  git init -q
+  git remote add origin "${CHROMIUM_SOURCE}" 2>/dev/null || git remote set-url origin "${CHROMIUM_SOURCE}"
+  case "${CHROMIUM_SOURCE}" in
+    *github.com*) _alt="https://chromium.googlesource.com/chromium/src.git" ;;
+    *)            _alt="https://github.com/chromium/chromium.git" ;;
+  esac
+  git fetch --depth 1 --no-tags "${CHROMIUM_SOURCE}" \
+      "+refs/tags/${chromium_version}:refs/tags/${chromium_version}" \
+    || { echo "primary source failed, falling back to ${_alt}"
+         git remote set-url origin "${_alt}"
+         git fetch --depth 1 --no-tags "${_alt}" \
+             "+refs/tags/${chromium_version}:refs/tags/${chromium_version}"; } \
+    || { popd; return 1; }
+  git checkout -q "${chromium_version}" || { popd; return 1; }
+  popd
 
   ## Fetch depot-tools
   depot_tools_commit=$(grep 'depot_tools.git' src/DEPS | cut -d\' -f8)
@@ -123,14 +143,13 @@ function prepare_repos {
   ln -s ../../depot_tools
   popd
 
-  ## Sync files (SDK/NDK/JDK/node/aapt2/bundletool arrive here via CIPD)
-  gclient.py sync --nohooks --no-history --shallow --revision=${chromium_version} || return $?
+  git config --global http.lowSpeedTime 120
+  DEPOT_TOOLS_UPDATE=0 gclient sync -D --no-history --nohooks --shallow
+  _sync_rc=$?
+  git config --global http.lowSpeedTime 900
+  [ $_sync_rc -eq 0 ] || return $_sync_rc
 
-
-  # node_modules for WebUI build
   ( src/third_party/node/update_npm_deps ) || return $?
-  # devtools' node_modules lacks rollup's native binary; fetch it directly
-  # from the public registry (devtools' .npmrc points at a mirror without it).
   ROLLUP_VER=$(grep '"version"' src/third_party/devtools-frontend/src/node_modules/rollup/package.json | head -1 | cut -d'"' -f4)
   _rollup_dest="src/third_party/devtools-frontend/src/node_modules/@rollup/rollup-linux-x64-gnu"
   if [ ! -f "${_rollup_dest}/rollup.linux-x64-gnu.node" ]; then
@@ -140,24 +159,18 @@ function prepare_repos {
   fi
   [ -f "${_rollup_dest}/rollup.linux-x64-gnu.node" ] || { echo "FATAL: rollup native module missing"; return 1; }
 
-  ## Hooks (subset of src/DEPS hooks)
   python3 src/build/util/lastchange.py -o src/build/util/LASTCHANGE
   python3 src/tools/download_optimization_profile.py --newest_state=src/chrome/android/profiles/newest.txt --local_state=src/chrome/android/profiles/local.txt --output_name=src/chrome/android/profiles/afdo.prof --gs_url_base=chromeos-prebuilt/afdo-job/llvm || return $?
   python3 src/tools/download_optimization_profile.py --newest_state=src/chrome/android/profiles/arm.newest.txt --local_state=src/chrome/android/profiles/arm.local.txt --output_name=src/chrome/android/profiles/arm.afdo.prof --gs_url_base=chromeos-prebuilt/afdo-job/llvm || return $?
   python3 src/build/util/lastchange.py -m GPU_LISTS_VERSION --revision-id-only --header src/gpu/config/gpu_lists_version.h
   python3 src/build/util/lastchange.py -m SKIA_COMMIT_HASH -s src/third_party/skia --header src/skia/ext/skia_commit_hash.h
   python3 src/build/util/lastchange.py -m DAWN_COMMIT_HASH -s src/third_party/dawn --revision src/gpu/webgpu/DAWN_VERSION --header src/gpu/webgpu/dawn_commit_hash.h
-  # Prebuilt clang + sysroots
   python3 src/tools/clang/scripts/update.py
   python3 src/build/linux/sysroot_scripts/install-sysroot.py --arch=amd64
-  # i386 sysroot required by the clang_x86 secondary toolchain on Android builds
   python3 src/build/linux/sysroot_scripts/install-sysroot.py --arch=i386
-  # V8 builtins PGO profiles are consumed when is_official_build=true.
   python3 src/v8/tools/builtins-pgo/download_profiles.py download --depot-tools "$(pwd -P)/depot_tools" --check-v8-revision --quiet || return $?
-  # Needed for an ad-block list used in webview
   cp misc/UnindexedRules src/third_party/subresource-filter-ruleset/data
 }
-
 
 function reverse_change {
   if [ "$path_modified" = true ] ; then
@@ -169,8 +182,20 @@ function reverse_change {
 # Run preparation
 for i in $(seq 1 10); do prepare_repos && s=0 && break || s=$? && reverse_change && sleep 120; done; (exit $s)
 
+# Install build dependencies (opt-in). install-build-deps.py calls sudo itself, including
+# `dpkg --add-architecture i386`, so it must not be wrapped in sudo. --unsupported is required
+# on Kali: the script only recognises Debian and Ubuntu focal/jammy/noble/resolute.
+if [ "$INSTALL_DEPS" = y ]; then
+    if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        echo "FATAL: --install-deps needs root or passwordless sudo, or it will hang on a password prompt."
+        echo "  run it by hand:  ( cd src && ./build/install-build-deps.sh --no-prompt --android --unsupported )"
+        echo "  or allow apt:    echo 'USER ALL=(ALL) NOPASSWD: /usr/bin/apt-get, /usr/bin/dpkg' | sudo tee /etc/sudoers.d/chromium-deps"
+        exit 6
+    fi
+    ( cd src && ./build/install-build-deps.sh --no-prompt --android --unsupported ) || exit $?
+fi
+
 ## Run ungoogled-chromium scripts
-# Patch prune list and GN flags for the Android build
 patch -p1 --ignore-whitespace -i patches/Other/ungoogled-main-repo-fix.patch --no-backup-if-mismatch
 # Remove the cache file if exists
 cache_file="domsubcache.tar.gz"
@@ -182,7 +207,6 @@ fi
 python3 ungoogled-chromium/utils/prune_binaries.py src ungoogled-chromium/pruning.list --keep-contingent-paths || true
 python3 ungoogled-chromium/utils/patches.py apply src ungoogled-chromium/patches
 python3 ungoogled-chromium/utils/domain_substitution.py apply -r ungoogled-chromium/domain_regex.list -f ungoogled-chromium/domain_substitution.list -c ${cache_file} src
-
 
 # Additional Source Patches
 ## Extra fixes for Chromium source
@@ -199,17 +223,14 @@ if [[ -f ${cache_file} ]] ; then
 fi
 python3 ungoogled-chromium/utils/domain_substitution.py apply -r ungoogled-chromium/domain_regex.list -f ${substitution_list_2} -c ${cache_file} src
 
-## Empty attestations file: pruned, but android_assets still bundles it.
 psa_dat="src/components/privacy_sandbox/privacy_sandbox_attestations/preload/privacy-sandbox-attestations.dat"
 [[ -f ${psa_dat} ]] || : > ${psa_dat}
 
-## Restore prefs sources still compiled at 150 after pruning.
 ( cd src && git checkout HEAD -- \
     components/signin/public/base/signin_pref_names.h \
     components/signin/public/base/signin_pref_names.cc \
     components/safe_browsing/core/common/safe_browsing_prefs.h \
     components/safe_browsing/core/common/safe_browsing_prefs.cc 2>/dev/null ) || true
-
 
 ## Configure output folder
 export PATH=$OLD_PATH  # remove depot_tools from PATH
@@ -218,7 +239,6 @@ output_folder="out/Default"
 mkdir -p "${output_folder}"
 if [ "$DEBUG" = n ] ; then
     cat ../ungoogled-chromium/flags.gn ../android_flags.gn ../android_flags.release.gn > "${output_folder}"/args.gn
-    # Release keystore if present, else gn's default debug keystore.
     if [ -f ../../uc_keystore/keystore.gn ]; then
         cat ../../uc_keystore/keystore.gn >> "${output_folder}"/args.gn
     fi
@@ -231,7 +251,6 @@ printf '\nandroid_override_version_name="'"${chromium_version}"'"\n' >> "${outpu
 
 gn gen "${output_folder}" --fail-on-unused-args
 popd
-
 
 ## Set compiler flags
 export AR=${AR:=llvm-ar}
@@ -246,25 +265,29 @@ apk_out_folder="apk_out"
 mkdir -p "${apk_out_folder}"
 pushd src
 if [[ "$TARGET" != "all" ]]; then
-  ninja -C "${output_folder}" "${TARGET_EXPANDED}"
+  ninja ${NINJA_JOBS:+-j ${NINJA_JOBS}} -C "${output_folder}" "${TARGET_EXPANDED}"
   if [[ "$TARGET" == "trichrome_chrome_bundle_target" ]] || [[ "$TARGET" == "chrome_modern_target" ]] || [[ "$TARGET" == "trichrome_chrome_apk_target" ]] || [[ "$TARGET" == "trichrome_webview_target" ]]; then
-    ../bundle_generate_apk.sh -o "${output_folder}" -a "${ARCH}" -t "${TARGET_EXPANDED}"
+    if [ -f ../../uc_keystore/uc-release-key.keystore ]; then
+      ../bundle_generate_apk.sh -o "${output_folder}" -a "${ARCH}" -t "${TARGET_EXPANDED}"
+    fi
   fi
   if [[ "$TARGET" != "webview_target" ]]; then
-    find ${output_folder}/apks/release -iname "*.apk" -exec cp -f {} ../"${apk_out_folder}" \;
+    _apk_src="${output_folder}/apks/release"
+    [ -d "${_apk_src}" ] || _apk_src="${output_folder}/apks"
+    find "${_apk_src}" -maxdepth 1 -iname "*.apk" -exec cp -f {} ../"${apk_out_folder}" \;
   else
     find ${output_folder}/apks -iname "*.apk" -exec cp -f {} ../"${apk_out_folder}" \;
   fi
 else
-  ninja -C out/Default "$chrome_modern_target"
+  ninja ${NINJA_JOBS:+-j ${NINJA_JOBS}} -C out/Default "$chrome_modern_target"
   ../bundle_generate_apk.sh -o "${output_folder}" -a "${ARCH}" -t "$chrome_modern_target"
-  ninja -C out/Default "$webview_target"
-  ninja -C out/Default "$trichrome_webview_target"
+  ninja ${NINJA_JOBS:+-j ${NINJA_JOBS}} -C out/Default "$webview_target"
+  ninja ${NINJA_JOBS:+-j ${NINJA_JOBS}} -C out/Default "$trichrome_webview_target"
   find ${output_folder}/apks/release -iname "*.apk" -exec cp -f {} ../"${apk_out_folder}" \;
 
   # arm64+TriChrome needs to be run separately, otherwise it will fail
   if [[ "$ARCH" != "arm64" ]]; then
-    ninja -C "${output_folder}" "$trichrome_chrome_apk_target"
+    ninja ${NINJA_JOBS:+-j ${NINJA_JOBS}} -C "${output_folder}" "$trichrome_chrome_apk_target"
     find ${output_folder}/apks/release -iname "*.apk" -exec cp -f {} ../"${apk_out_folder}" \;
   fi
 fi

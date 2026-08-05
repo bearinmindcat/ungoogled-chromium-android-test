@@ -24,6 +24,9 @@ solutions = [
     },
     "custom_vars": {
         "checkout_configuration": "small",
+        # From jqssun's Titanium: drops the telemetry dependency tree entirely, which is
+        # a meaningful number of fewer repos to fetch from googlesource.
+        "checkout_telemetry_dependencies": False,
     },
   },
 ]
